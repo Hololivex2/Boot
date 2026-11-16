@@ -2,25 +2,79 @@ name: Build PixelBoost ADB APK
 
 on:
   push:
-    branches: [ main, master ]
+    branches:
+      - main
+      - master
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build-apk:
-    name: Build Debug APK
+    name: Build PixelBoost Debug APK
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Extract PixelBoost project archive
+      - name: Locate and extract PixelBoost project
+        shell: bash
         run: |
-          if [ -f pixelboost-adb.zip ]; then
-            mkdir -p /tmp/pixelboost-project
-            unzip -q pixelboost-adb.zip -d /tmp/pixelboost-project
-            cp -a /tmp/pixelboost-project/. .
+          set -euo pipefail
+
+          if { [ -f settings.gradle.kts ] || [ -f settings.gradle ]; } && { [ -f app/build.gradle.kts ] || [ -f app/build.gradle ]; }; then
+            echo "PROJECT_ROOT=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+            echo "Android project found at repository root."
+            exit 0
           fi
+
+          mapfile -t ZIP_FILES < <(
+            find "$GITHUB_WORKSPACE" -maxdepth 2 -type f -iname 'pixelboost-adb*.zip' \
+              -not -path '*/.git/*' | sort
+          )
+
+          if [ "\${#ZIP_FILES[@]}" -eq 0 ]; then
+            echo "::error::No PixelBoost archive found. Upload pixelboost-adb.zip (or pixelboost-adb (1).zip) to the repository root."
+            exit 1
+          fi
+
+          if [ "\${#ZIP_FILES[@]}" -gt 1 ]; then
+            echo "::error::More than one PixelBoost archive was found. Keep only the intended latest ZIP in the repository."
+            printf ' - %s\n' "\${ZIP_FILES[@]}"
+            exit 1
+          fi
+
+          TARGET_ZIP="\${ZIP_FILES[0]}"
+          EXTRACT_DIR="$GITHUB_WORKSPACE/_pixelboost_extracted"
+          rm -rf "$EXTRACT_DIR"
+          mkdir -p "$EXTRACT_DIR"
+          echo "Extracting: $TARGET_ZIP"
+          unzip -q "$TARGET_ZIP" -d "$EXTRACT_DIR"
+
+          PROJECT_ROOT=""
+          while IFS= read -r SETTINGS_FILE; do
+            CANDIDATE="$(dirname "$SETTINGS_FILE")"
+            if { [ -f "$CANDIDATE/app/build.gradle.kts" ] || [ -f "$CANDIDATE/app/build.gradle" ]; }; then
+              PROJECT_ROOT="$CANDIDATE"
+              break
+            fi
+          done < <(
+            find "$EXTRACT_DIR" -maxdepth 6 -type f \
+              \( -name settings.gradle.kts -o -name settings.gradle \) \
+              -not -path '*/__MACOSX/*' | sort
+          )
+
+          if [ -z "$PROJECT_ROOT" ]; then
+            echo "::error::ZIP extracted, but no valid Android project containing settings.gradle(.kts) and app/build.gradle(.kts) was found."
+            find "$EXTRACT_DIR" -maxdepth 4 -type f | head -200
+            exit 1
+          fi
+
+          echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
+          echo "Detected Android project root: $PROJECT_ROOT"
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
@@ -28,48 +82,81 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Set up Android SDK
+      - name: Set up Android SDK command-line tools
         uses: android-actions/setup-android@v4
-        with:
-          packages: |
-            platform-tools
-            platforms;android-36.1
-            build-tools;36.0.0
 
-      - name: Verify Android Gradle project
+      - name: Install Android SDK packages
+        shell: bash
         run: |
-          if [ ! -f settings.gradle.kts ] && [ ! -f settings.gradle ]; then
-            echo "::error::Missing settings.gradle(.kts). Upload pixelboost-adb.zip to the repository root."
-            exit 1
-          fi
-          if [ ! -f app/build.gradle.kts ] && [ ! -f app/build.gradle ]; then
-            echo "::error::Missing app Gradle module."
-            exit 1
-          fi
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-36.1" \
+            "build-tools;36.1.0"
+          sdkmanager --list_installed
 
       - name: Set up Gradle 9.3.1
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '9.3.1'
 
-      - name: Prepare debug keystore
+      - name: Verify project and prepare debug keystore
+        shell: bash
+        working-directory: ${{ env.PROJECT_ROOT }}
         run: |
-          if [ -f debug.keystore.base64 ]; then
-            base64 -d debug.keystore.base64 > debug.keystore
-          elif [ ! -f debug.keystore ]; then
-            keytool -genkeypair -v -keystore debug.keystore \
-              -storepass android -alias androiddebugkey -keypass android \
-              -keyalg RSA -keysize 2048 -validity 10000 \
+          set -euo pipefail
+
+          if [ ! -f settings.gradle.kts ] && [ ! -f settings.gradle ]; then
+            echo "::error::Gradle settings file is missing in PROJECT_ROOT."
+            exit 1
+          fi
+          if [ ! -f app/build.gradle.kts ] && [ ! -f app/build.gradle ]; then
+            echo "::error::The app Gradle module is missing."
+            exit 1
+          fi
+
+          echo "Project root: $PWD"
+          grep -R -nE 'com.android.application|agp =|gradle-[0-9].*-bin.zip|minorApiLevel' \
+            build.gradle.kts settings.gradle.kts gradle/libs.versions.toml \
+            gradle/wrapper/gradle-wrapper.properties app/build.gradle.kts 2>/dev/null || true
+
+          if [ ! -f debug.keystore ]; then
+            keytool -genkeypair -v \
+              -keystore debug.keystore \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
               -dname "CN=Android Debug,O=Android,C=US"
           fi
 
       - name: Build Debug APK
-        run: gradle :app:assembleDebug --no-daemon
+        shell: bash
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: |
+          set -euo pipefail
+          gradle :app:assembleDebug --no-daemon --stacktrace
 
-      - name: Upload APK artifact
+      - name: Verify APK output
+        shell: bash
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: |
+          set -euo pipefail
+          APK="$PWD/app/build/outputs/apk/debug/app-debug.apk"
+          if [ ! -s "$APK" ]; then
+            echo "::error::Build completed without a non-empty app-debug.apk at the expected output path."
+            find app/build/outputs -maxdepth 5 -type f -name '*.apk' -print 2>/dev/null || true
+            exit 1
+          fi
+          ls -lh "$APK"
+
+      - name: Upload Debug APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: PixelBoost-ADB-debug-apk
-          path: app/build/outputs/apk/debug/*.apk
+          path: ${{ env.PROJECT_ROOT }}/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 30
