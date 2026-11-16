@@ -21,7 +21,21 @@ jobs:
           java-version: '21'
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+
+      - name: Verify Android Gradle project
+        run: |
+          if [ ! -f settings.gradle ] && [ ! -f settings.gradle.kts ]; then
+            echo "::error::Android Gradle project is missing: settings.gradle or settings.gradle.kts was not found."
+            echo "Upload the Android project source before building the APK."
+            exit 1
+          fi
+          if [ ! -f app/build.gradle ] && [ ! -f app/build.gradle.kts ]; then
+            echo "::error::The app module is missing: app/build.gradle or app/build.gradle.kts was not found."
+            exit 1
+          fi
 
       - name: Set up Gradle 9.3.1
         uses: gradle/actions/setup-gradle@v4
