@@ -14,6 +14,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Extract PixelBoost project archive
+        run: |
+          if [ -f pixelboost-adb.zip ]; then
+            mkdir -p /tmp/pixelboost-project
+            unzip -q pixelboost-adb.zip -d /tmp/pixelboost-project
+            cp -a /tmp/pixelboost-project/. .
+          fi
+
       - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
@@ -30,8 +38,14 @@ jobs:
 
       - name: Verify Android Gradle project
         run: |
-          test -f settings.gradle.kts || test -f settings.gradle
-          test -f app/build.gradle.kts || test -f app/build.gradle
+          if [ ! -f settings.gradle.kts ] && [ ! -f settings.gradle ]; then
+            echo "::error::Missing settings.gradle(.kts). Upload pixelboost-adb.zip to the repository root."
+            exit 1
+          fi
+          if [ ! -f app/build.gradle.kts ] && [ ! -f app/build.gradle ]; then
+            echo "::error::Missing app Gradle module."
+            exit 1
+          fi
 
       - name: Set up Gradle 9.3.1
         uses: gradle/actions/setup-gradle@v4
